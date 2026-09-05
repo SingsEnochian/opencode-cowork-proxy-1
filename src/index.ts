@@ -80,6 +80,17 @@ function hasImages(body: any): boolean {
   );
 }
 
+// Claude and Qwen models on Zen/Go are exposed via Anthropic-compatible /messages,
+// not OpenAI-compatible /chat/completions.
+function isAnthropicNativeModel(model: string): boolean {
+  return model.startsWith('claude-') || model.startsWith('qwen');
+}
+
+// Upstreams include /v1 already; avoid producing /v1/v1/messages for custom upstreams that don't.
+function messagesUrl(upstream: string): string {
+  return upstream.endsWith('/v1') ? `${upstream}/messages` : `${upstream}/v1/messages`;
+}
+
 function upstreamErrorResponse(res: Response, body: string): Response {
   const headers = new Headers();
   for (const name of ["Content-Type", "Retry-After", "RateLimit-Limit", "RateLimit-Remaining", "RateLimit-Reset"]) {
@@ -94,30 +105,26 @@ async function handleRequest(request: Request): Promise<Response> {
   const upstream = getUpstream(request, route.upstream);
   const fmt = upstreamFormat(request);
 
-  // Anthropic → OpenAI (for Claude Desktop/Cowork → any OpenAI API)
+  // Anthropic → upstream (translated to OpenAI, or passed through for Anthropic-native models)
   if (route.path === '/v1/messages' && request.method === 'POST') {
       const key = extractApiKey(request.headers);
       const err = validateApiKey(key);
       if (err) return authErrorResponse(err);
 
-      if (fmt === "openai") {
-        const req = await request.json();
-        const originalModel = req.model;
-        if (route.modelOverride) req.model = route.modelOverride;
-        if (hasImages(req)) {
-          req.model = VISION_MODEL;
-        }
+      const req = await request.json();
+      const originalModel = req.model;
+      if (route.modelOverride) req.model = route.modelOverride;
+
+      // Vision always uses the OpenAI path with the dedicated vision model, regardless of base model.
+      if (hasImages(req)) {
+        req.model = VISION_MODEL;
         const openaiReq = formatAnthropicToOpenAI(req);
         const res = await fetch(`${upstream}/chat/completions`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${key}`,
-          },
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
           body: JSON.stringify(openaiReq),
         });
         if (!res.ok) return upstreamErrorResponse(res, await res.text());
-
         if (openaiReq.stream) {
           return new Response(streamOpenAIToAnthropic(res.body as ReadableStream, originalModel), {
             headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" },
@@ -129,13 +136,34 @@ async function handleRequest(request: Request): Promise<Response> {
         });
       }
 
-      // Pass-through to Anthropic upstream
-      const res = await fetch(`${upstream}/v1/messages`, {
+      // Claude and Qwen models use Anthropic-compatible /messages on both Go and Zen.
+      // Explicit x-upstream-format: anthropic also forces pass-through.
+      if (fmt === "anthropic" || isAnthropicNativeModel(req.model)) {
+        const res = await fetch(messagesUrl(upstream), {
+          method: "POST",
+          headers: anthropicHeaders(request, key!),
+          body: JSON.stringify(req),
+        });
+        return res;
+      }
+
+      // Default: translate Anthropic → OpenAI and forward to /chat/completions.
+      const openaiReq = formatAnthropicToOpenAI(req);
+      const res = await fetch(`${upstream}/chat/completions`, {
         method: "POST",
-        headers: anthropicHeaders(request, key!),
-        body: await request.text(),
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
+        body: JSON.stringify(openaiReq),
       });
-      return res;
+      if (!res.ok) return upstreamErrorResponse(res, await res.text());
+      if (openaiReq.stream) {
+        return new Response(streamOpenAIToAnthropic(res.body as ReadableStream, originalModel), {
+          headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" },
+        });
+      }
+      const data: any = await res.json();
+      return new Response(JSON.stringify(toAnthropicResponse(data, originalModel)), {
+        headers: { "Content-Type": "application/json" },
+      });
   }
 
   // OpenAI → Anthropic (or pass-through)

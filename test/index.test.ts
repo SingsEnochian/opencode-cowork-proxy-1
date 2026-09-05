@@ -89,9 +89,9 @@ describe('worker routing', () => {
     }));
   });
 
-  it('routes /zen-prefixed Anthropic requests to OpenCode Zen', async () => {
+  it('routes /zen-prefixed qwen requests to Anthropic messages endpoint (not chat/completions)', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] }), {
+      new Response(JSON.stringify({ content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       }),
@@ -105,10 +105,84 @@ describe('worker routing', () => {
 
     await worker.fetch(request);
 
-    expect(fetchMock).toHaveBeenCalledWith('https://opencode.ai/zen/v1/chat/completions', expect.objectContaining({
+    expect(fetchMock).toHaveBeenCalledWith('https://opencode.ai/zen/v1/messages', expect.objectContaining({
       method: 'POST',
-      headers: expect.objectContaining({ Authorization: `Bearer ${key}` }),
+      headers: expect.objectContaining({ 'X-Api-Key': key }),
     }));
+  });
+
+  it('auto-routes claude models on /zen to Anthropic messages endpoint', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    await worker.fetch(request);
+
+    expect(fetchMock).toHaveBeenCalledWith('https://opencode.ai/zen/v1/messages', expect.objectContaining({
+      method: 'POST',
+      headers: expect.objectContaining({ 'X-Api-Key': key }),
+    }));
+  });
+
+  it('auto-routes claude models on /go to Anthropic messages endpoint', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const request = new Request('https://proxy.example/go/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({ model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    await worker.fetch(request);
+
+    expect(fetchMock).toHaveBeenCalledWith('https://opencode.ai/zen/go/v1/messages', expect.objectContaining({
+      method: 'POST',
+      headers: expect.objectContaining({ 'X-Api-Key': key }),
+    }));
+  });
+
+  it('vision requests use OpenAI path even when model is claude or qwen', async () => {
+    let capturedUrl = '';
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, _init) => {
+      capturedUrl = url as string;
+      return new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    const request = new Request('https://proxy.example/zen/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'What is in this image?' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc123' } },
+          ],
+        }],
+        max_tokens: 1024,
+      }),
+    });
+
+    await worker.fetch(request);
+    expect(capturedUrl).toBe('https://opencode.ai/zen/v1/chat/completions');
   });
 
   it('preserves upstream rate limit headers on translated errors', async () => {
